@@ -13,6 +13,9 @@ import torch
 import torch.nn as nn
 
 
+# ============================================================
+# Encoder
+# ============================================================
 
 class TemporalEncoder(nn.Module):
     """
@@ -21,6 +24,8 @@ class TemporalEncoder(nn.Module):
     """
     def __init__(self, d_in=64, d_hidden=64, d_gru=128):
         super().__init__()
+        self.d_gru = d_gru
+
         self.stem = nn.Linear(d_in, d_hidden)
         self.conv = nn.Conv1d(d_hidden, d_hidden, kernel_size=3, padding=1)
         self.gru = nn.GRU(d_hidden, d_gru, batch_first=True)
@@ -33,15 +38,17 @@ class TemporalEncoder(nn.Module):
         Returns:
             z: (B, T, d_gru)
         """
-        x = self.act(self.stem(x))           # (B, T, d_hidden)
-        x = x.transpose(1, 2)                # (B, d_hidden, T)
+        x = self.act(self.stem(x))      # (B, T, d_hidden)
+        x = x.transpose(1, 2)           # (B, d_hidden, T)
         x = self.act(self.conv(x))
-        x = x.transpose(1, 2)                # (B, T, d_hidden)
-        z, _ = self.gru(x)                   # (B, T, d_gru)
+        x = x.transpose(1, 2)           # (B, T, d_hidden)
+        z, _ = self.gru(x)              # (B, T, d_gru)
         return z
 
 
-
+# ============================================================
+# Masked Reconstruction Task
+# ============================================================
 
 class MaskedReconstructionTask(nn.Module):
     """
@@ -50,13 +57,14 @@ class MaskedReconstructionTask(nn.Module):
     - Feature-group masking
     - Feature-normalized loss
     """
-    def __init__(self, encoder, d_in=64):
+    def __init__(self, encoder: TemporalEncoder, d_in=64):
         super().__init__()
         self.encoder = encoder
+        d_gru = encoder.d_gru  # 🔒 SINGLE SOURCE OF TRUTH
 
-        # Strong reconstruction head (do NOT weaken this)
+        # Strong reconstruction head
         self.recon_head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(d_gru, 128),
             nn.GELU(),
             nn.Linear(128, 128),
             nn.GELU(),
@@ -85,12 +93,14 @@ class MaskedReconstructionTask(nn.Module):
         B, T, F = x.shape
         device = x.device
 
+        # ----------------------------------------------------
+        # Temporal span masking (biased to recent timesteps)
+        # ----------------------------------------------------
         temporal_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
 
         for b in range(B):
             num_spans = max(1, int(T * mask_prob / mask_span_length))
             for _ in range(num_spans):
-                # Bias masking toward recent timesteps
                 start = int((torch.rand(1, device=device) ** 2) * (T - mask_span_length))
                 temporal_mask[b, start:start + mask_span_length] = True
 
@@ -101,15 +111,16 @@ class MaskedReconstructionTask(nn.Module):
 
         for b in range(B):
             for t in torch.where(temporal_mask[b])[0]:
-                # 70% random, 30% correlated group masking
                 if torch.rand(1, device=device) < 0.3:
-                    # correlated groups
+                    # correlated masking
                     group_pairs = [
                         (4, 5),  # prices + volumes
                         (1, 2),  # dynamics + regime
                         (6, 1),  # trades + dynamics
                     ]
-                    g1, g2 = group_pairs[torch.randint(0, len(group_pairs), (1,)).item()]
+                    g1, g2 = group_pairs[
+                        torch.randint(0, len(group_pairs), (1,), device=device).item()
+                    ]
                     feature_mask[b, t, self.feature_groups[g1]] = True
                     feature_mask[b, t, self.feature_groups[g2]] = True
                 else:
@@ -118,17 +129,22 @@ class MaskedReconstructionTask(nn.Module):
                     for g in groups:
                         feature_mask[b, t, self.feature_groups[g]] = True
 
-
+        # ----------------------------------------------------
+        # Mask input
+        # ----------------------------------------------------
         x_masked = x.clone()
         x_masked[feature_mask] = 0.0
 
-
-        z = self.encoder(x_masked)            # (B, T, 128)
-        x_recon = self.recon_head(z)           # (B, T, F)
+        # ----------------------------------------------------
+        # Encode + reconstruct
+        # ----------------------------------------------------
+        z = self.encoder(x_masked)        # (B, T, d_gru)
+        x_recon = self.recon_head(z)      # (B, T, F)
 
         if feature_mask.sum() == 0:
             return torch.tensor(0.0, device=device)
 
+        # Feature-wise scale normalization
         scale = x.std(dim=(0, 1), keepdim=True) + 1e-8
         diff = (x_recon - x) ** 2 / (scale ** 2)
 
@@ -136,6 +152,9 @@ class MaskedReconstructionTask(nn.Module):
         return loss
 
 
+# ============================================================
+# Progressive Masking Schedule
+# ============================================================
 
 class ProgressiveMasking:
     """
