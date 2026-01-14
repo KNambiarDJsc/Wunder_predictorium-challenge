@@ -1,10 +1,9 @@
 """
-Supervised predictor training script.
+Supervised predictor training script (FAST + SAFE).
 CRITICAL: Last timestep only, small batches, no shuffle, two-phase training
-THIS IS WHERE MOST PEOPLE FAIL
 """
+
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 import numpy as np
@@ -18,235 +17,225 @@ from src.loss import CompetitionLoss
 def train_predictor(
     data_path='data/train.parquet',
     encoder_path='models/encoder_pretrained.pt',
-    epochs_phase1=80,
-    epochs_phase2=40,
-    batch_size=8,  # CRITICAL: ≤ 8
+    epochs_phase1=35,   # 🔥 reduced (was 80)
+    epochs_phase2=15,   # 🔥 reduced (was 40)
+    batch_size=4,       # 🔥 faster on CPU than 8
     lr_phase1=5e-4,
     lr_phase2=5e-5,
     device='cpu',
-    save_path='models/predictor_final.pt'
+    save_path='models/predictor_final.pt',
+    resume=True
 ):
-    """
-    Train supervised predictor with correlation-aware loss.
-    
-    CRITICAL REQUIREMENTS:
-    - Train on LAST timestep ONLY: pred[:, -1]
-    - Batch size ≤ 8 (smaller = better correlation gradients)
-    - NO SHUFFLE (temporal integrity)
-    - Gradient clipping EVERY step
-    - Cosine LR schedule
-    - Two-phase training:
-        Phase 1: encoder frozen
-        Phase 2: unfreeze GRU only, LR × 0.1
-    - Track abstention rate (target: 70-85% silence)
-    """
     device = torch.device(device)
     print(f"Training on {device}")
-    
-    # Create models directory
+
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    
-    # Data (NO SHUFFLE, batch size ≤ 8)
+
+    # ===================== DATA =====================
     print("Loading dataset...")
     dataset = SequenceDataset(data_path, store_numpy=True)
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,  # CRITICAL: ≤ 8
-        shuffle=False,  # CRITICAL: NO SHUFFLE
-        num_workers=4,
-        pin_memory=True if device.type == 'cuda' else False
+        batch_size=batch_size,
+        shuffle=False,          # CRITICAL
+        num_workers=2,          # Windows-friendly
+        pin_memory=False        # CPU safe
     )
     print(f"Loaded {len(dataset)} sequences")
-    
-    # Load pretrained encoder
+
+    # ===================== MODEL =====================
     print("Loading pretrained encoder...")
     encoder = TemporalEncoder(d_in=64, d_hidden=64, d_gru=96)
     encoder.load_state_dict(torch.load(encoder_path, map_location=device))
-    
-    # Model (encoder frozen initially)
+
     model = Predictor(encoder, freeze_encoder=True, unfreeze_gru=False).to(device)
-    
-    # Loss
-    criterion = CompetitionLoss(alpha_mse=0.15, alpha_conf=0.1, alpha_abstain=0.05)
-    
-    # ========== PHASE 1: ENCODER FROZEN ==========
-    print("\n" + "="*60)
-    print("PHASE 1: Training with frozen encoder")
-    print("="*60)
-    
-    # Optimizer (only trainable parameters)
+
+    criterion = CompetitionLoss(
+        alpha_mse=0.15,
+        alpha_conf=0.1,
+        alpha_abstain=0.05
+    )
+
+    # ===================== PHASE 1 =====================
+    print("\n" + "=" * 60)
+    print("PHASE 1: Encoder frozen")
+    print("=" * 60)
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr_phase1,
         weight_decay=1e-5
     )
-    
-    # Cosine LR schedule
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=epochs_phase1,
         eta_min=lr_phase1 * 0.1
     )
-    
+
     best_corr = -1.0
-    
-    for epoch in range(epochs_phase1):
+    start_epoch = 0
+    ckpt_path = save_path.replace('.pt', '_phase1_ckpt.pt')
+
+    # -------- Resume Phase 1 --------
+    if resume and Path(ckpt_path).exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_corr = ckpt["best_corr"]
+        print(f"✓ Resumed Phase 1 from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, epochs_phase1):
         model.train()
-        
-        epoch_losses = []
-        epoch_corrs_t0 = []
-        epoch_corrs_t1 = []
-        epoch_confs = []
-        
-        for batch_idx, batch in enumerate(loader):
-            x = batch['x'].to(device)  # (B, 1000, 64)
-            y = batch['y'].to(device)  # (B, 1000, 2)
-            mask = batch['pred_mask'].to(device)  # (B, 1000)
-            
+
+        loss_sum = 0.0
+        corr_sum = 0.0
+        conf_sum = 0.0
+        steps = 0
+
+        for batch in loader:
+            x = batch['x'].to(device)
+            y = batch['y'].to(device)
+            mask = batch['pred_mask'].to(device)
+
             optimizer.zero_grad()
-            
-            # CRITICAL: Get predictions for LAST timestep ONLY
-            # Model.forward() already returns last timestep
-            pred, conf = model(x)  # (B, 2), (B, 1)
-            
-            # Extract last timestep target
-            y_last = y[:, -1, :]  # (B, 2)
-            mask_last = mask[:, -1]  # (B,)
-            
-            # Compute loss on last timestep
+
+            # 🔥 FAST PATH: last timestep only
+            pred, conf = model(x[:, -1:, :])
+
+            y_last = y[:, -1, :]
+            mask_last = mask[:, -1]
+
             loss, metrics = criterion(pred, conf, y_last, mask_last)
-            
-            # Backward with gradient clipping EVERY step
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
-            epoch_losses.append(loss.item())
-            epoch_corrs_t0.append(metrics['corr_t0'])
-            epoch_corrs_t1.append(metrics['corr_t1'])
-            epoch_confs.append(metrics['mean_conf'])
-        
+
+            loss_sum += loss.item()
+            corr_sum += 0.5 * (metrics['corr_t0'] + metrics['corr_t1'])
+            conf_sum += metrics['mean_conf']
+            steps += 1
+
         scheduler.step()
-        
-        # Statistics
-        mean_loss = np.mean(epoch_losses)
-        mean_corr_t0 = np.mean(epoch_corrs_t0)
-        mean_corr_t1 = np.mean(epoch_corrs_t1)
-        mean_corr = (mean_corr_t0 + mean_corr_t1) / 2
-        mean_conf = np.mean(epoch_confs)
-        
-        # TRACK ABSTENTION RATE (target: 70-85% silence)
-        abstention_rate = 1.0 - mean_conf
-        
-        print(f"Epoch {epoch+1}/{epochs_phase1} | "
-              f"Loss: {mean_loss:.4f} | "
-              f"Corr: {mean_corr:.4f} (t0={mean_corr_t0:.4f}, t1={mean_corr_t1:.4f}) | "
-              f"Conf: {mean_conf:.3f} | "
-              f"Abstain: {abstention_rate:.1%} | "
-              f"LR: {scheduler.get_last_lr()[0]:.2e}")
-        
-        # Save best model
+
+        mean_loss = loss_sum / steps
+        mean_corr = corr_sum / steps
+        mean_conf = conf_sum / steps
+
+        print(
+            f"Epoch {epoch+1}/{epochs_phase1} | "
+            f"Loss {mean_loss:.4f} | "
+            f"Corr {mean_corr:.4f} | "
+            f"Conf {mean_conf:.3f} | "
+            f"Abstain {(1-mean_conf):.1%}"
+        )
+
+        # Save best + checkpoint
         if mean_corr > best_corr:
             best_corr = mean_corr
             torch.save(model.state_dict(), save_path.replace('.pt', '_phase1_best.pt'))
-    
-    # ========== PHASE 2: UNFREEZE GRU ONLY ==========
-    print("\n" + "="*60)
-    print("PHASE 2: Fine-tuning with GRU unfrozen")
-    print("="*60)
-    
-    # Load best from phase 1
+
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "best_corr": best_corr
+        }, ckpt_path)
+
+    # ===================== PHASE 2 =====================
+    print("\n" + "=" * 60)
+    print("PHASE 2: GRU unfrozen")
+    print("=" * 60)
+
     model.load_state_dict(torch.load(save_path.replace('.pt', '_phase1_best.pt')))
-    
-    # Unfreeze GRU only
-    for param in model.encoder.gru.parameters():
-        param.requires_grad = True
-    
-    # New optimizer with lower LR
+
+    for p in model.encoder.gru.parameters():
+        p.requires_grad = True
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr_phase2,
         weight_decay=1e-5
     )
-    
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=epochs_phase2,
         eta_min=lr_phase2 * 0.1
     )
-    
+
     for epoch in range(epochs_phase2):
         model.train()
-        
-        epoch_losses = []
-        epoch_corrs_t0 = []
-        epoch_corrs_t1 = []
-        epoch_confs = []
-        
-        for batch_idx, batch in enumerate(loader):
+
+        loss_sum = 0.0
+        corr_sum = 0.0
+        conf_sum = 0.0
+        steps = 0
+
+        for batch in loader:
             x = batch['x'].to(device)
             y = batch['y'].to(device)
             mask = batch['pred_mask'].to(device)
-            
+
             optimizer.zero_grad()
-            
-            pred, conf = model(x)
+
+            pred, conf = model(x[:, -1:, :])
             y_last = y[:, -1, :]
             mask_last = mask[:, -1]
-            
+
             loss, metrics = criterion(pred, conf, y_last, mask_last)
-            
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
-            epoch_losses.append(loss.item())
-            epoch_corrs_t0.append(metrics['corr_t0'])
-            epoch_corrs_t1.append(metrics['corr_t1'])
-            epoch_confs.append(metrics['mean_conf'])
-        
+
+            loss_sum += loss.item()
+            corr_sum += 0.5 * (metrics['corr_t0'] + metrics['corr_t1'])
+            conf_sum += metrics['mean_conf']
+            steps += 1
+
         scheduler.step()
-        
-        mean_loss = np.mean(epoch_losses)
-        mean_corr_t0 = np.mean(epoch_corrs_t0)
-        mean_corr_t1 = np.mean(epoch_corrs_t1)
-        mean_corr = (mean_corr_t0 + mean_corr_t1) / 2
-        mean_conf = np.mean(epoch_confs)
-        abstention_rate = 1.0 - mean_conf
-        
-        print(f"Epoch {epoch+1}/{epochs_phase2} | "
-              f"Loss: {mean_loss:.4f} | "
-              f"Corr: {mean_corr:.4f} (t0={mean_corr_t0:.4f}, t1={mean_corr_t1:.4f}) | "
-              f"Conf: {mean_conf:.3f} | "
-              f"Abstain: {abstention_rate:.1%} | "
-              f"LR: {scheduler.get_last_lr()[0]:.2e}")
-        
+
+        mean_loss = loss_sum / steps
+        mean_corr = corr_sum / steps
+        mean_conf = conf_sum / steps
+
+        print(
+            f"[P2] Epoch {epoch+1}/{epochs_phase2} | "
+            f"Loss {mean_loss:.4f} | "
+            f"Corr {mean_corr:.4f} | "
+            f"Conf {mean_conf:.3f}"
+        )
+
         if mean_corr > best_corr:
             best_corr = mean_corr
             torch.save(model.state_dict(), save_path)
-    
-    print(f"\n✓ Best correlation: {best_corr:.4f}")
+
+    print(f"\n✓ Training complete | Best corr = {best_corr:.4f}")
     print(f"✓ Model saved to {save_path}")
-    
     return model
 
 
 if __name__ == '__main__':
     import argparse
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default='data/train.parquet')
     parser.add_argument('--encoder', type=str, default='models/encoder_pretrained.pt')
-    parser.add_argument('--epochs-p1', type=int, default=80)
-    parser.add_argument('--epochs-p2', type=int, default=40)
-    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--epochs-p1', type=int, default=35)
+    parser.add_argument('--epochs-p2', type=int, default=15)
+    parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--lr-p1', type=float, default=5e-4)
     parser.add_argument('--lr-p2', type=float, default=5e-5)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--save', type=str, default='models/predictor_final.pt')
-    
+
     args = parser.parse_args()
-    
+
     train_predictor(
         data_path=args.data,
         encoder_path=args.encoder,
