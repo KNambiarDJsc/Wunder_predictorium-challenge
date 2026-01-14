@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---- Virtual environments ----
+.venv/
+.venv311/
+venv/
+.env/
+.uv/
+
+# ---- Training artifacts ----
+models/*.pt
+models/*.pth
+models/*.ckpt
+
+# ---- ONNX (optional: keep if you want versioned) ----
+# models/*.onnx
+
+# ---- Data ----
+datasets/
+data/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
