@@ -1,20 +1,17 @@
 """
 Feature engineering for LOB prediction.
 CRITICAL: Correlation > MSE, Stability > Spikes
+TRAINING REFERENCE IMPLEMENTATION
 """
 
 import numpy as np
 from numba import jit
-
-
 
 DEPTH_WEIGHTS = np.array(
     [1.0, 0.5, 0.333, 0.25, 0.2, 0.167], dtype=np.float32
 )
 
 EPS = 1e-8
-
-
 
 
 @jit(nopython=True)
@@ -32,7 +29,9 @@ def compute_features(p, v, dp, dv):
     T = p.shape[0]
     features = np.zeros((T, 64), dtype=np.float32)
 
-
+    # =====================
+    # GEOMETRY
+    # =====================
     bid_best = p[:, 0]
     ask_best = p[:, 6]
     mid = (bid_best + ask_best) * 0.5
@@ -57,7 +56,9 @@ def compute_features(p, v, dp, dv):
     features[:, 3] = bid_vol_curve
     features[:, 4] = ask_vol_curve
 
-
+    # =====================
+    # DYNAMICS
+    # =====================
     delta_mid = np.zeros(T, dtype=np.float32)
     delta_mid[1:] = mid[1:] - mid[:-1]
 
@@ -68,15 +69,15 @@ def compute_features(p, v, dp, dv):
     for t in range(T):
         for i in range(4):
             if dv[t, i] > 0:
-                signed_pressure[t] += (
-                    dv[t, i] if dp[t, i] > mid[t] else -dv[t, i]
-                )
+                signed_pressure[t] += dv[t, i] if dp[t, i] > mid[t] else -dv[t, i]
 
     features[:, 5] = delta_mid
     features[:, 6] = delta_imb
     features[:, 7] = signed_pressure
 
-
+    # =====================
+    # REGIME
+    # =====================
     vol_proxy = np.zeros(T, dtype=np.float32)
     for t in range(10, T):
         vol_proxy[t] = np.std(delta_mid[t - 10 : t])
@@ -92,7 +93,9 @@ def compute_features(p, v, dp, dv):
     features[:, 9] = vol_intensity
     features[:, 10] = imb_persist
 
-
+    # =====================
+    # CONFIDENCE SIGNALS
+    # =====================
     vol_high = np.zeros(T, dtype=np.float32)
     for t in range(20, T):
         threshold = np.percentile(vol_proxy[:t], 75)
@@ -104,20 +107,26 @@ def compute_features(p, v, dp, dv):
     features[:, 12] = np.abs(delta_imb)
     features[:, 13] = trade_dom
 
-
+    # =====================
+    # RAW FEATURES
+    # =====================
     features[:, 14:26] = p
     features[:, 26:38] = v
     features[:, 38:42] = dp
     features[:, 42:46] = dv
 
-
+    # =====================
+    # RELATIVE PRICES
+    # =====================
     features[:, 46] = spread / (spread.mean() + EPS)
 
     for i in range(6):
         features[:, 47 + i] = (p[:, i] - mid) / (spread + EPS)
         features[:, 53 + i] = (p[:, 6 + i] - mid) / (spread + EPS)
 
-
+    # =====================
+    # SELECTIVE NORMALIZATION
+    # =====================
     for i in (2, 5, 6):
         std = features[:, i].std()
         if std > 1e-6:
@@ -126,10 +135,12 @@ def compute_features(p, v, dp, dv):
     return features
 
 
-
-
 @jit(nopython=True)
 def compute_features_stateful(p, v, dp, dv, history, step):
+    """
+    Stateful version for streaming inference.
+    MUST remain numerically identical to batch version.
+    """
     features = np.zeros(64, dtype=np.float32)
 
     mid = (p[0] + p[6]) * 0.5
@@ -212,7 +223,6 @@ def compute_features_stateful(p, v, dp, dv, history, step):
         features[47 + i] = (p[i] - mid) / (spread + EPS)
         features[53 + i] = (p[6 + i] - mid) / (spread + EPS)
 
-    # update stats first, then normalize
     for i in (2, 5, 6):
         history["feature_sum"][i] += features[i]
         history["feature_sq_sum"][i] += features[i] * features[i]
