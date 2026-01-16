@@ -5,24 +5,28 @@ import onnxruntime as ort
 
 # Allow importing utils
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(f"{CURRENT_DIR}/..")
+sys.path.append(os.path.join(CURRENT_DIR, ".."))
 
 from utils import DataPoint
 
 
 class PredictionModel:
     """
-    Competition-compatible inference wrapper.
-    STRICTLY follows the official baseline interface.
+    Competition submission model.
+
+    CRITICAL:
+    - Uses ONLY data_point.state
+    - Stateful across sequence
+    - No feature recomputation
+    - ONNX-safe
     """
 
     def __init__(self):
-        self.current_seq_ix = None
-        self.sequence_history = []
+        self.current_seq = None
+        self.buffer = []
 
-        # Load ONNX from submission directory
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        onnx_path = os.path.join(base_dir, "predictor_final.onnx")
+        # Load ONNX model from SAME directory as solution.py
+        onnx_path = os.path.join(CURRENT_DIR, "predictor_final.onnx")
 
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = 1
@@ -31,47 +35,34 @@ class PredictionModel:
 
         self.session = ort.InferenceSession(
             onnx_path,
-            sess_options,
-            providers=["CPUExecutionProvider"]
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
         )
 
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [o.name for o in self.session.get_outputs()]
 
+    def reset(self):
+        self.buffer = []
+
     def predict(self, data_point: DataPoint):
-        """
-        Args:
-            data_point.state : np.ndarray (feature vector)
-            data_point.need_prediction : bool
-        """
-
         # Reset state on new sequence
-        if self.current_seq_ix != data_point.seq_ix:
-            self.current_seq_ix = data_point.seq_ix
-            self.sequence_history = []
+        if self.current_seq != data_point.seq_ix:
+            self.current_seq = data_point.seq_ix
+            self.reset()
 
-        # Append current feature vector
-        self.sequence_history.append(data_point.state.copy())
+        # Append feature vector (state is already processed)
+        self.buffer.append(data_point.state.astype(np.float32))
 
-        # Warm-up period: MUST return None
+        # Evaluator expects None before prediction window
         if not data_point.need_prediction:
             return None
 
-        # Build window (last 1000 steps or whatever model expects)
-        window = self.sequence_history[-1000:]
+        # Build input tensor (1, T, F)
+        x = np.expand_dims(np.stack(self.buffer, axis=0), axis=0)
 
-        # Pad if needed (safety)
-        if len(window) < 1000:
-            pad = [np.zeros_like(window[0])] * (1000 - len(window))
-            window = pad + window
+        # Run ONNX inference
+        pred, conf = self.session.run(self.output_names, {self.input_name: x})
 
-        x = np.asarray(window, dtype=np.float32)[None, :, :]
-
-        # ONNX inference
-        outputs = self.session.run(self.output_names, {self.input_name: x})
-
-        # Predictor outputs (pred, conf)
-        pred = outputs[0][0]
-
-        # Clamp per competition rules
-        return np.clip(pred, -6.0, 6.0)
+        # Return clipped prediction
+        return np.clip(pred[0], -6.0, 6.0)
